@@ -1,84 +1,66 @@
-import time
-import json
-import redis
-from typing import Any, Dict, Optional
+"""Core retry queue built on Redis."""
 
-DEFAULT_MAX_RETRIES = 5
-DEFAULT_BASE_DELAY = 1.0  # seconds
-DEFAULT_BACKOFF_FACTOR = 2.0
+import json
+import time
+from typing import Optional
+
+from retryq.dead_letter import DeadLetterQueue
+
+PENDING_KEY = "retryq:pending"
+PROCESSING_KEY = "retryq:processing"
 
 
 class RetryQueue:
-    """
-    A simple task retry queue with exponential backoff backed by Redis.
-    """
+    """Simple task queue with exponential-backoff retry support."""
 
-    def __init__(
-        self,
-        redis_client: redis.Redis,
-        queue_name: str = "retryq",
-        max_retries: int = DEFAULT_MAX_RETRIES,
-        base_delay: float = DEFAULT_BASE_DELAY,
-        backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
-    ):
+    def __init__(self, redis_client, max_retries: int = 5, dead_letter: Optional[DeadLetterQueue] = None):
         self.redis = redis_client
-        self.queue_name = queue_name
-        self.pending_key = f"{queue_name}:pending"
-        self.scheduled_key = f"{queue_name}:scheduled"
-        self.dead_key = f"{queue_name}:dead"
         self.max_retries = max_retries
-        self.base_delay = base_delay
-        self.backoff_factor = backoff_factor
+        self.dead_letter = dead_letter
 
-    def enqueue(self, task_id: str, payload: Dict[str, Any]) -> None:
+    def enqueue(self, task_id: str, payload: dict, priority: float = None) -> None:
         """Push a new task onto the pending queue."""
         task = {
-            "task_id": task_id,
+            "id": task_id,
             "payload": payload,
-            "attempt": 0,
+            "attempts": 0,
+            "enqueued_at": time.time(),
         }
-        self.redis.rpush(self.pending_key, json.dumps(task))
+        score = priority if priority is not None else time.time()
+        self.redis.zadd(PENDING_KEY, {json.dumps(task): score})
 
-    def dequeue(self) -> Optional[Dict[str, Any]]:
-        """Pop the next task from the pending queue."""
-        raw = self.redis.lpop(self.pending_key)
-        if raw is None:
+    def dequeue(self) -> Optional[dict]:
+        """Pop the highest-priority task from the pending queue."""
+        results = self.redis.zpopmin(PENDING_KEY, 1)
+        if not results:
             return None
-        return json.loads(raw)
+        raw, _ = results[0]
+        task = json.loads(raw)
+        self.redis.hset(PROCESSING_KEY, task["id"], json.dumps(task))
+        return task
 
-    def retry(self, task: Dict[str, Any]) -> bool:
-        """
-        Schedule a task for retry with exponential backoff.
-        Returns False if max retries exceeded (task moved to dead queue).
-        """
-        attempt = task.get("attempt", 0) + 1
-        if attempt > self.max_retries:
-            self.redis.rpush(self.dead_key, json.dumps(task))
+    def acknowledge(self, task_id: str) -> None:
+        """Mark a task as successfully completed."""
+        self.redis.hdel(PROCESSING_KEY, task_id)
+
+    def retry(self, task: dict, delay: float = 0.0) -> bool:
+        """Re-enqueue a task for retry. Returns False if max retries exceeded."""
+        task = dict(task)
+        task["attempts"] = task.get("attempts", 0) + 1
+
+        if task["attempts"] > self.max_retries:
+            self.redis.hdel(PROCESSING_KEY, task["id"])
+            if self.dead_letter is not None:
+                self.dead_letter.push(task, reason="max_retries_exceeded")
             return False
 
-        delay = self.base_delay * (self.backoff_factor ** (attempt - 1))
-        run_at = time.time() + delay
-        task["attempt"] = attempt
-        self.redis.zadd(self.scheduled_key, {json.dumps(task): run_at})
+        score = time.time() + delay
+        self.redis.hdel(PROCESSING_KEY, task["id"])
+        self.redis.zadd(PENDING_KEY, {json.dumps(task): score})
         return True
 
-    def poll_scheduled(self) -> int:
-        """Move due scheduled tasks back to the pending queue. Returns count moved."""
-        now = time.time()
-        due_tasks = self.redis.zrangebyscore(self.scheduled_key, "-inf", now)
-        if not due_tasks:
-            return 0
-        pipe = self.redis.pipeline()
-        for raw in due_tasks:
-            pipe.zrem(self.scheduled_key, raw)
-            pipe.rpush(self.pending_key, raw)
-        pipe.execute()
-        return len(due_tasks)
+    def pending_count(self) -> int:
+        return self.redis.zcard(PENDING_KEY)
 
-    def queue_lengths(self) -> Dict[str, int]:
-        """Return current lengths of pending, scheduled, and dead queues."""
-        return {
-            "pending": self.redis.llen(self.pending_key),
-            "scheduled": self.redis.zcard(self.scheduled_key),
-            "dead": self.redis.llen(self.dead_key),
-        }
+    def processing_count(self) -> int:
+        return self.redis.hlen(PROCESSING_KEY)
