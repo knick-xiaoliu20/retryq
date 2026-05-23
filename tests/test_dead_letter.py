@@ -42,6 +42,17 @@ def test_push_trims_to_max(dlq, redis_mock):
     pipe.ltrim.assert_called_once_with(DEAD_LETTER_KEY, 0, 99)
 
 
+def test_push_default_reason(dlq, redis_mock):
+    """Verify that push uses a default reason when none is provided."""
+    task = {"id": "t_default", "payload": {}}
+    dlq.push(task)
+    pipe = redis_mock.pipeline.return_value
+    args = pipe.lpush.call_args[0]
+    entry = json.loads(args[1])
+    assert "reason" in entry
+    assert entry["reason"] is not None
+
+
 def test_pop_returns_none_when_empty(dlq, redis_mock):
     redis_mock.lpop.return_value = None
     assert dlq.pop() is None
