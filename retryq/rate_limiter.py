@@ -36,6 +36,16 @@ class RateLimiter:
     def _now(self) -> float:
         return time.monotonic()
 
+    def _parse_state(self, state: dict, now: float) -> tuple[float, float]:
+        """Parse raw Redis hash state into (current_tokens, last_refill)."""
+        if state:
+            current_tokens = float(state.get(b"tokens", self.max_tokens))
+            last_refill = float(state.get(b"last_refill", now))
+        else:
+            current_tokens = float(self.max_tokens)
+            last_refill = now
+        return current_tokens, last_refill
+
     def acquire(self, tokens: int = 1) -> bool:
         """
         Try to acquire *tokens* from the bucket.
@@ -48,12 +58,7 @@ class RateLimiter:
         results = pipe.execute()
         state = results[0]
 
-        if state:
-            current_tokens = float(state.get(b"tokens", self.max_tokens))
-            last_refill = float(state.get(b"last_refill", now))
-        else:
-            current_tokens = float(self.max_tokens)
-            last_refill = now
+        current_tokens, last_refill = self._parse_state(state, now)
 
         elapsed = max(0.0, now - last_refill)
         refilled = elapsed * self.refill_rate
@@ -73,13 +78,11 @@ class RateLimiter:
 
     def available_tokens(self) -> float:
         """Return the current (approximate) number of available tokens."""
+        now = self._now()
         state = self.redis.hgetall(self.key)
-        if not state:
-            return float(self.max_tokens)
-        tokens = float(state.get(b"tokens", self.max_tokens))
-        last_refill = float(state.get(b"last_refill", self._now()))
-        elapsed = max(0.0, self._now() - last_refill)
-        return min(self.max_tokens, tokens + elapsed * self.refill_rate)
+        current_tokens, last_refill = self._parse_state(state, now)
+        elapsed = max(0.0, now - last_refill)
+        return min(self.max_tokens, current_tokens + elapsed * self.refill_rate)
 
     def reset(self) -> None:
         """Delete the bucket key, effectively resetting the limiter."""
